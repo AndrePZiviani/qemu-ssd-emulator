@@ -28,6 +28,11 @@
 #include "hw/virtio/virtio-bus.h"
 #include "hw/virtio/virtio-access.h"
 
+#include "block/block-backend.h"
+#include "sysemu/cpus.h"
+
+#include "hack/hack.h"
+
 VirtIOBlockReq *virtio_blk_alloc_request(VirtIOBlock *s)
 {
     VirtIOBlockReq *req = g_new(VirtIOBlockReq, 1);
@@ -597,6 +602,37 @@ static void virtio_blk_handle_output(VirtIODevice *vdev, VirtQueue *vq)
     VirtIOBlockReq *req;
     MultiReqBuffer mrb = {};
 
+    // ponteiro para as variaveis declaradas em virtio.h
+    // para ser visivel em outras partes do codigo
+    bool *hack = &s->parent_obj.hack;
+    bool *itime = &s->parent_obj.itime;
+    HackList *tmp;
+#pragma GCC diagnostic ignored "-Wnested-externs"
+    extern HackList *hacklist;
+    extern KVMClockState *kvm_clock;
+#pragma GCC diagnostic warning "-Wnested-externs"
+
+    struct kvm_clock_data data;
+
+    for (tmp=hacklist; tmp != NULL; tmp=tmp->next) {
+		if (strcmp(s->blk->bs->filename, tmp->name) == 0) {
+			*hack=true;
+			s->blk->hack=true;
+			if (strcmp(tmp->itime,"on") == 0) {
+				*itime=true;
+				s->blk->itime=true;
+			}
+			else {
+				*itime=false;
+				s->blk->itime=false;
+			}
+			break;
+		}
+	}
+    if (tmp == NULL)
+    	*hack=false;
+
+
     /* Some guests kick before setting VIRTIO_CONFIG_S_DRIVER_OK so start
      * dataplane here instead of waiting for .set_status().
      */
@@ -607,12 +643,44 @@ static void virtio_blk_handle_output(VirtIODevice *vdev, VirtQueue *vq)
 
     blk_io_plug(s->blk);
 
+    if (*hack) {
+    	meu_qemu_mutex_lock();
+    	cpu_disable_ticks();
+
+    	pause_all_vcpus_hacked(&data);
+    	//data.clock = data.clock - (75000 * smp_cpus);
+    	kvm_clock->clock_armed = true;
+
+    	qemu_barrier_init(smp_cpus+1);
+    }
+
     while ((req = virtio_blk_get_request(s))) {
         virtio_blk_handle_request(req, &mrb);
     }
 
     if (mrb.num_reqs) {
         virtio_blk_submit_multireq(s->blk, &mrb);
+    }
+
+    if (*hack){
+    	bdrv_drain_all();
+
+
+    	resume_all_vcpus();
+
+    	kvm_clock->clock=data.clock;
+
+
+    	qemu_mutex_unlock_iothread();
+    	qemu_barrier_destroy();
+    	qemu_mutex_lock_iothread();
+
+    	kvmclock_start(kvm_clock);
+    	cpu_enable_ticks();
+
+    	qemu_barrier_wait_inc();
+
+    	meu_qemu_mutex_unlock();
     }
 
     blk_io_unplug(s->blk);
@@ -925,6 +993,7 @@ static void virtio_blk_device_realize(DeviceState *dev, Error **errp)
     virtio_init(vdev, "virtio-blk", VIRTIO_ID_BLOCK,
                 sizeof(struct virtio_blk_config));
 
+    vdev->hack=true;
     s->blk = conf->conf.blk;
     s->rq = NULL;
     s->sector_mask = (s->conf.conf.logical_block_size / BDRV_SECTOR_SIZE) - 1;

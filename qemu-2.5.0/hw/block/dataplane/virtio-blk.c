@@ -25,6 +25,8 @@
 #include "block/aio.h"
 #include "hw/virtio/virtio-bus.h"
 #include "qom/object_interfaces.h"
+#include "hack/hack.h"
+#include "sysemu/cpus.h"
 
 struct VirtIOBlockDataPlane {
     bool started;
@@ -92,9 +94,25 @@ static void handle_notify(EventNotifier *e)
     VirtIOBlockDataPlane *s = container_of(e, VirtIOBlockDataPlane,
                                            host_notifier);
     VirtIOBlock *vblk = VIRTIO_BLK(s->vdev);
+    bool hack;
+    bool itime;
+#pragma GCC diagnostic ignored "-Wnested-externs"
+    extern KVMClockState *kvm_clock;
+#pragma GCC diagnostic warning "-Wnested-externs"
+
+    struct kvm_clock_data data;
+    int hack_count=0,hack_time=0;
+
+    hack=vblk->parent_obj.hack;
+    itime=vblk->parent_obj.itime;
+
+    bool first=true;
+    uint32_t is_write; //check if request is read or write
 
     event_notifier_test_and_clear(&s->host_notifier);
     blk_io_plug(s->conf->conf.blk);
+
+
     for (;;) {
         MultiReqBuffer mrb = {};
         int ret;
@@ -111,9 +129,45 @@ static void handle_notify(EventNotifier *e)
                 break; /* no more requests */
             }
 
+            if (first && hack) {
+                	qemu_mutex_lock_iothread();
+                	meu_qemu_mutex_lock();
+                	cpu_disable_ticks();
+
+                	pause_all_vcpus_hacked(&data);
+                	//data.clock = data.clock - (75000 * smp_cpus);
+                	kvm_clock->clock_armed = true;
+
+                	qemu_barrier_init(smp_cpus+1);
+                	//qemu_mutex_unlock_iothread();
+
+                	first=false;
+                }
+
             trace_virtio_blk_data_plane_process_request(s, req->elem.out_num,
                                                         req->elem.in_num,
                                                         req->elem.index);
+
+            /*if (hack) {
+            	if (itime) {
+					VirtIOBlockReq *hack_req = virtio_blk_alloc_request(vblk);
+					iov_to_buf(req->elem.out_sg, req->elem.out_num, 0, &hack_req->out,sizeof(hack_req->out));
+					is_write = virtio_ldl_p(VIRTIO_DEVICE(req->dev), &hack_req->out.type);
+					virtio_blk_free_request(hack_req);
+					//incrementa um contador de quantos IOs teve
+					hack_count++;
+					if (is_write) { //escrita
+						//incrementa o acumulador de tempo
+						hack_time+=rand_normal(100000,2000);
+						hack_time-=rand_normal(42000 + (9000*smp_cpus), 1000);
+					}
+					else { //leitura
+						//incrementa acumulador de tempo
+						hack_time+=rand_normal(100000,2000);
+						hack_time-=rand_normal(40000 + (9000*smp_cpus), 1000);
+					}
+            	}
+            }*/
 
             virtio_blk_handle_request(req, &mrb);
         }
@@ -133,6 +187,28 @@ static void handle_notify(EventNotifier *e)
             break;
         }
     }
+
+    if (!first && hack){
+        	bdrv_drain_all();
+
+        	//cpu_enable_ticks();
+        	resume_all_vcpus();
+
+        	//soma o acumulador com o tempo atual
+        	kvm_clock->clock=data.clock + hack_time;
+
+
+        	//qemu_mutex_lock_iothread();
+        	qemu_mutex_unlock_iothread();
+        	qemu_barrier_destroy();
+
+        	kvmclock_start(kvm_clock);
+        	cpu_enable_ticks();
+        	qemu_barrier_wait_inc();
+
+        	meu_qemu_mutex_unlock();
+        }
+
     blk_io_unplug(s->conf->conf.blk);
 }
 
